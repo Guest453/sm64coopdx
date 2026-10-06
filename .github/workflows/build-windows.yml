@@ -1,0 +1,69 @@
+name: Build Windows x64
+
+# Cloud build for sm64coopdx (Windows x64).
+#
+# The upstream game assets are committed to the repository, so NO baserom /
+# ROM is required at build time (extract_assets.py is a contributor-only tool).
+# A real ROM is only checked at RUNTIME by src/pc/rom_checker.cpp.
+#
+# Optionally applies patch/current.patch before building, so a local C patch
+# can be compiled in the cloud without a local compiler.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 (mingw64 / x86_64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: mingw64
+          update: true
+          install: >-
+            unzip
+            make
+            git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-glew
+            mingw-w64-x86_64-SDL2
+            python3
+            zip
+
+      - name: Apply local patch (if present)
+        run: |
+          if [ -f patch/current.patch ]; then
+            echo "== applying patch/current.patch =="
+            git apply --verbose patch/current.patch
+          else
+            echo "== no patch/current.patch found, building pristine =="
+          fi
+
+      - name: Build the game
+        run: make -j$(nproc)
+
+      - name: Generate hash
+        run: |
+          cd tools
+          g++ -std=c++17 -o hash_file.exe hash_file.cpp
+          echo "::notice ::$(./hash_file.exe ../build/us_pc/sm64coopdx.exe)"
+
+      - name: Zip the game
+        run: |
+          cd ./build/us_pc
+          zip -r sm64coopdx_Windows.zip dynos lang mods palettes coop.map discord_game_sdk.dll sm64coopdx.exe coopdx_updater.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sm64coopdx-windows
+          path: ./build/us_pc/sm64coopdx_Windows.zip
