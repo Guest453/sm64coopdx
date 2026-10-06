@@ -1,0 +1,620 @@
+diff --git a/src/pc/gfx/gfx_direct3d11.cpp b/src/pc/gfx/gfx_direct3d11.cpp
+index 710c5d0..df7aeed 100644
+--- a/src/pc/gfx/gfx_direct3d11.cpp
++++ b/src/pc/gfx/gfx_direct3d11.cpp
+@@ -1,6 +1,7 @@
+ #if defined(_WIN32)
+ 
+ #include <cstdio>
++#include <cstring>
+ #include <vector>
+ #include <cmath>
+ 
+@@ -25,6 +26,8 @@
+ #include "gfx_rendering_api.h"
+ #include "gfx_direct3d_common.h"
+ 
++#include "../mc_capture.h"
++
+ extern "C" {
+     #include "pc/controller/controller_bind_mapping.h"
+     extern Color gVertexColor;
+@@ -99,6 +102,10 @@ static struct {
+     ComPtr<ID3D11DeviceContext> context;
+     ComPtr<ID3D11RenderTargetView> backbuffer_view;
+     ComPtr<ID3D11DepthStencilView> depth_stencil_view;
++    ComPtr<ID3D11Texture2D> backbuffer_texture;     // mc_capture: kept for colour readback
++    ComPtr<ID3D11Texture2D> depth_stencil_texture;  // mc_capture: kept for depth readback
++    ComPtr<ID3D11Texture2D> color_staging;          // mc_capture: CPU-readable copy of colour
++    ComPtr<ID3D11Texture2D> depth_staging;          // mc_capture: CPU-readable copy of depth
+     ComPtr<ID3D11RasterizerState> rasterizer_state;
+     ComPtr<ID3D11DepthStencilState> depth_stencil_state;
+     ComPtr<ID3D11Buffer> vertex_buffer;
+@@ -157,6 +164,10 @@ static void create_render_target_views(bool is_resize) {
+ 
+         d3d.backbuffer_view.Reset();
+         d3d.depth_stencil_view.Reset();
++        d3d.depth_stencil_texture.Reset(); // mc_capture
++        d3d.backbuffer_texture.Reset();    // mc_capture
++        d3d.color_staging.Reset();         // mc_capture
++        d3d.depth_staging.Reset();         // mc_capture
+ 
+         // Resize swap chain buffers
+ 
+@@ -199,6 +210,9 @@ static void create_render_target_views(bool is_resize) {
+     ThrowIfFailed(d3d.device->CreateTexture2D(&depth_stencil_texture_desc, nullptr, depth_stencil_texture.GetAddressOf()));
+     ThrowIfFailed(d3d.device->CreateDepthStencilView(depth_stencil_texture.Get(), nullptr, d3d.depth_stencil_view.GetAddressOf()));
+ 
++    d3d.depth_stencil_texture = depth_stencil_texture; // mc_capture: keep for depth readback
++    d3d.backbuffer_texture = backbuffer_texture;       // mc_capture: keep for colour readback
++
+     // Save resolution
+ 
+     d3d.current_width = desc1.Width;
+@@ -755,7 +769,98 @@ static void gfx_d3d11_start_frame(void) {
+     d3d.context->Unmap(d3d.per_frame_cb.Get(), 0);
+ }
+ 
++// ---- mc_capture: D3D11 colour + depth readback ----------------------------
++//
++// Called from gfx_d3d11_end_frame(), i.e. after the full frame (scene + HUD)
++// has been submitted and before IDXGISwapChain::Present(). We copy the
++// back-buffer and the game's depth texture into CPU-readable staging textures
++// and map them. The colour is already R8G8B8A8_UNORM (see gfx_dxgi.cpp), which
++// matches the shared-memory layout; the depth is copied row-by-row into the
++// tightly-packed f32 region (staging RowPitch is usually != w*4).
++//
++// D32_FLOAT is the format used on feature level 10_0+ (the common case). On a
++// D24_UNORM_S8_UINT device the depth copy is skipped (documented limitation);
++// see README.md.
++
++static bool mc_capture_d3d11_make_staging(ComPtr<ID3D11Texture2D> &staging,
++                                          DXGI_FORMAT format, uint32_t w, uint32_t h) {
++    if (staging.Get() != nullptr) { return true; }
++    D3D11_TEXTURE2D_DESC desc;
++    ZeroMemory(&desc, sizeof(desc));
++    desc.Width = w;
++    desc.Height = h;
++    desc.MipLevels = 1;
++    desc.ArraySize = 1;
++    desc.Format = format;
++    desc.SampleDesc.Count = 1;
++    desc.SampleDesc.Quality = 0;
++    desc.Usage = D3D11_USAGE_STAGING;
++    desc.BindFlags = 0;
++    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++    desc.MiscFlags = 0;
++    HRESULT hr = d3d.device->CreateTexture2D(&desc, nullptr, staging.GetAddressOf());
++    return SUCCEEDED(hr) && staging.Get() != nullptr;
++}
++
++static void mc_capture_d3d11_readback(McCaptureFrame *f, uint32_t w, uint32_t h) {
++    D3D11_MAPPED_SUBRESOURCE ms;
++
++    // Colour: back-buffer -> staging -> shared memory (RGBA8).
++    if (d3d.backbuffer_texture) {
++        if (mc_capture_d3d11_make_staging(d3d.color_staging, DXGI_FORMAT_R8G8B8A8_UNORM, w, h)) {
++            d3d.context->CopyResource(d3d.color_staging.Get(), d3d.backbuffer_texture.Get());
++            if (SUCCEEDED(d3d.context->Map(d3d.color_staging.Get(), 0, D3D11_MAP_READ, 0, &ms))) {
++                for (uint32_t y = 0; y < h; y++) {
++                    memcpy(f->color + (size_t)y * w * 4,
++                           (const uint8_t *)ms.pData + (size_t)y * ms.RowPitch,
++                           (size_t)w * 4);
++                }
++                d3d.context->Unmap(d3d.color_staging.Get(), 0);
++            }
++        }
++    }
++
++    // Depth: game depth texture -> staging -> shared memory (f32, 0..1).
++    if (d3d.depth_stencil_texture) {
++        D3D11_TEXTURE2D_DESC ddesc;
++        d3d.depth_stencil_texture->GetDesc(&ddesc);
++        if (ddesc.Format == DXGI_FORMAT_D32_FLOAT) {
++            if (mc_capture_d3d11_make_staging(d3d.depth_staging, DXGI_FORMAT_R32_FLOAT, w, h)) {
++                d3d.context->CopyResource(d3d.depth_staging.Get(), d3d.depth_stencil_texture.Get());
++                if (SUCCEEDED(d3d.context->Map(d3d.depth_staging.Get(), 0, D3D11_MAP_READ, 0, &ms))) {
++                    for (uint32_t y = 0; y < h; y++) {
++                        memcpy((uint8_t *)f->depth + (size_t)y * w * 4,
++                               (const uint8_t *)ms.pData + (size_t)y * ms.RowPitch,
++                               (size_t)w * 4);
++                    }
++                    d3d.context->Unmap(d3d.depth_staging.Get(), 0);
++                }
++            }
++        } else {
++            static bool warned = false;
++            if (!warned) {
++                warned = true;
++                fprintf(stderr, "[mc_capture] D3D11 depth format %u is not D32_FLOAT; depth not captured\n",
++                        (unsigned)ddesc.Format);
++            }
++        }
++    }
++}
++
+ static void gfx_d3d11_end_frame(void) {
++    // mc_capture: the scene + HUD are fully submitted; we are still bound to
++    // the back-buffer and before IDXGISwapChain::Present() (which runs in
++    // gfx_dxgi_swap_buffers_begin()). Hook here for D3D11.
++    if (mc_capture_should_capture()) {
++        McCaptureFrame f;
++        uint32_t w = d3d.current_width;
++        uint32_t h = d3d.current_height;
++
++        if (mc_capture_begin(&f, w, h, MC_DEPTH_CONVENTION_D3D_0_TO_1, 0u)) {
++            mc_capture_d3d11_readback(&f, w, h);
++            mc_capture_end(&f);
++        }
++    }
+ }
+ 
+ static const char* gfx_d3d11_get_name(void) {
+diff --git a/src/pc/gfx/gfx_opengl.c b/src/pc/gfx/gfx_opengl.c
+index ff35d03..d2eb985 100644
+--- a/src/pc/gfx/gfx_opengl.c
++++ b/src/pc/gfx/gfx_opengl.c
+@@ -32,6 +32,8 @@
+ #include "gfx_rendering_api.h"
+ #include "gfx_pc.h"
+ 
++#include "../mc_capture.h"
++
+ #define TEX_CACHE_STEP 512
+ 
+ struct ShaderProgram {
+@@ -869,6 +871,28 @@ static void gfx_opengl_start_frame(void) {
+ }
+ 
+ static void gfx_opengl_end_frame(void) {
++    // mc_capture: the scene + HUD display list has been submitted and flushed
++    // (gfx_flush() runs in gfx_end_frame_render() before this), and we are
++    // still bound to the default framebuffer before SDL_GL_SwapWindow(). This
++    // is the single best per-frame hook: colour + depth are both intact.
++    if (mc_capture_should_capture()) {
++        McCaptureFrame f;
++        uint32_t w = gfx_current_dimensions.width;
++        uint32_t h = gfx_current_dimensions.height;
++
++        if (mc_capture_begin(&f, w, h, MC_DEPTH_CONVENTION_GL_NEG1_TO_1, MC_FLAG_ORIGIN_BOTTOM)) {
++            glPixelStorei(GL_PACK_ALIGNMENT, 1);
++            glReadBuffer(GL_BACK);
++
++            // Colour: bottom-left origin RGBA8, matches the depth rows.
++            glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, f.color);
++
++            // Depth: read as f32 window depth in [0,1] (near=0, far=1).
++            glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_DEPTH_COMPONENT, GL_FLOAT, f.depth);
++
++            mc_capture_end(&f);
++        }
++    }
+ }
+ 
+ static void gfx_opengl_finish_render(void) {
+diff --git a/src/pc/gfx/gfx_pc.c b/src/pc/gfx/gfx_pc.c
+index 6563430..0cb2187 100644
+--- a/src/pc/gfx/gfx_pc.c
++++ b/src/pc/gfx/gfx_pc.c
+@@ -39,6 +39,8 @@
+ #include "pc/gfx/gfx_screen_config.h"
+ #include "pc/gfx/gfx_window_manager_api.h"
+ 
++#include "pc/mc_capture.h"
++
+ #define G_TX_LOADTILE_6_UNKNOWN 6
+ 
+ u8 gGfxPcResetTex1 = 0;
+@@ -690,6 +692,18 @@ static void OPTIMIZE_O3 gfx_sp_matrix(uint8_t parameters, const int32_t *addr) {
+     if (parameters & G_MTX_PROJECTION) {
+         if (parameters & G_MTX_LOAD) {
+             mtxf_copy(rsp.P_matrix, matrix);
++
++            // mc_capture: the scene perspective is loaded once per frame with
++            // G_MTX_PROJECTION | G_MTX_LOAD. Recover near/far from the matrix
++            // (see guPerspectiveF.c: m[2][2]=(n+f)/(n-f), m[3][2]=2nf/(n-f))
++            // and record them for the shared-memory depth header.
++            if (matrix[2][3] == -1.0f && matrix[3][2] != 0.0f) {
++                float nearPlane = matrix[3][2] / (matrix[2][2] - 1.0f);
++                float farPlane  = matrix[3][2] / (matrix[2][2] + 1.0f);
++                if (nearPlane > 0.0f && farPlane > nearPlane) {
++                    mc_capture_set_projection(nearPlane, farPlane);
++                }
++            }
+         } else {
+             mtxf_mul(rsp.P_matrix, matrix, rsp.P_matrix);
+         }
+diff --git a/src/pc/mc_capture.c b/src/pc/mc_capture.c
+new file mode 100644
+index 0000000..349da5b
+--- /dev/null
++++ b/src/pc/mc_capture.c
+@@ -0,0 +1,270 @@
++/*
++ * mc_capture.c — publish sm64coopdx's rendered frame to Windows shared memory.
++ *
++ * See mc_capture.h for the public API and README.md for the full rationale.
++ *
++ * Design:
++ *   - One named mapping "Local\\SM64MCFrame", created on first use and kept
++ *     for the process lifetime (never re-created per frame).
++ *   - A 64-byte header followed by two fixed-offset regions:
++ *       colour  : MC_CAPTURE_MAX_W * MC_CAPTURE_MAX_H * 4 bytes (RGBA8)
++ *       depth   : MC_CAPTURE_MAX_W * MC_CAPTURE_MAX_H * 4 bytes (f32)
++ *     Regions are reserved at max size so their offsets never move; each frame
++ *     only fills the leading width*height*4 bytes.
++ *   - A seqlock: header.seq is odd while the writer is mid-frame, even once
++ *     the frame is complete and stable. The reader spins until it reads the
++ *     same even seq before and after copying.
++ *
++ * Writer-side ordering: x86 has TSO (stores are not reordered with other
++ * stores), so a compiler barrier between the payload writes and the seq store
++ * is sufficient for the single-writer/single-reader seqlock. We still use a
++ * full compiler barrier and document the assumption.
++ */
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "pc/mc_capture.h"
++
++/* ------------------------------------------------------------------------- */
++/* Header (exactly 64 bytes)                                                 */
++/* ------------------------------------------------------------------------- */
++
++struct McCaptureHeader {
++    char     magic[8];        /*  0 : "SM64MC01"                               */
++    uint32_t version;         /*  8 : MC_CAPTURE_VERSION                       */
++    uint32_t header_size;     /* 12 : sizeof(struct McCaptureHeader) == 64     */
++    uint32_t width;           /* 16 : pixels                                   */
++    uint32_t height;          /* 20 : pixels                                   */
++    uint32_t stride;          /* 24 : bytes per row in the colour region        */
++    uint32_t depth_convention;/* 28 : MC_DEPTH_CONVENTION_*                     */
++    float    near_plane;      /* 32 : world units                               */
++    float    far_plane;       /* 36 : world units                               */
++    uint32_t flags;           /* 40 : MC_FLAG_*                                 */
++    uint32_t reserved;        /* 44 : 0                                         */
++    uint64_t frame_counter;   /* 48 : increments once per published frame       */
++    uint64_t seq;             /* 56 : seqlock; odd while writing                */
++};
++
++/* Compile-time check that the header is exactly 64 bytes (no padding). */
++typedef char mc_capture_header_size_check[
++    (sizeof(struct McCaptureHeader) == MC_CAPTURE_HEADER_SIZE) ? 1 : -1];
++
++#define MC_COLOR_OFFSET (MC_CAPTURE_HEADER_SIZE)
++#define MC_DEPTH_OFFSET (MC_CAPTURE_HEADER_SIZE + (MC_CAPTURE_MAX_W * MC_CAPTURE_MAX_H * 4u))
++
++/* ------------------------------------------------------------------------- */
++/* Platform shim                                                             */
++/* ------------------------------------------------------------------------- */
++
++/* Compiler-only barrier; see the file header for the memory-ordering notes. */
++#if defined(_MSC_VER)
++#  define MC_COMPILER_BARRIER() _ReadWriteBarrier()
++#else
++#  define MC_COMPILER_BARRIER() __asm__ __volatile__("" ::: "memory")
++#endif
++
++#if defined(_WIN32)
++
++#include <windows.h>
++
++static HANDLE  s_mapping = NULL;
++static uint8_t *s_view    = NULL;
++static bool    s_failed   = false; /* creation failed once; do not retry */
++
++static void mc_capture_write_magic(struct McCaptureHeader *h) {
++    static const char kMagic[8] = { 'S', 'M', '6', '4', 'M', 'C', '0', '1' };
++    memcpy(h->magic, kMagic, sizeof(kMagic));
++}
++
++/* Create + map the shared segment on first use. Returns s_view or NULL. */
++static uint8_t *mc_capture_get_view(void) {
++    if (s_view) { return s_view; }
++    if (s_failed) { return NULL; }
++
++    const size_t size = (size_t)MC_CAPTURE_MAPPING_SIZE;
++
++    s_mapping = CreateFileMappingW(
++        INVALID_HANDLE_VALUE,       /* backed by the pagefile */
++        NULL,                       /* default security      */
++        PAGE_READWRITE,
++        (DWORD)((uint64_t)size >> 32),
++        (DWORD)((uint64_t)size & 0xffffffffu),
++        MC_CAPTURE_SHM_NAME);
++    if (s_mapping == NULL) {
++        fprintf(stderr, "[mc_capture] CreateFileMappingW failed (err %lu)\n",
++                (unsigned long)GetLastError());
++        s_failed = true;
++        return NULL;
++    }
++
++    s_view = (uint8_t *)MapViewOfFile(s_mapping, FILE_MAP_ALL_ACCESS, 0, 0, size);
++    if (s_view == NULL) {
++        fprintf(stderr, "[mc_capture] MapViewOfFile failed (err %lu)\n",
++                (unsigned long)GetLastError());
++        CloseHandle(s_mapping);
++        s_mapping = NULL;
++        s_failed = true;
++        return NULL;
++    }
++
++    memset(s_view, 0, size);
++
++    {
++        struct McCaptureHeader *h = (struct McCaptureHeader *)s_view;
++        mc_capture_write_magic(h);
++        h->version          = MC_CAPTURE_VERSION;
++        h->header_size      = MC_CAPTURE_HEADER_SIZE;
++        h->width            = 0;
++        h->height           = 0;
++        h->stride           = 0;
++        h->depth_convention = MC_DEPTH_CONVENTION_GL_NEG1_TO_1;
++        h->near_plane       = 0.0f;
++        h->far_plane        = 0.0f;
++        h->flags            = 0;
++        h->reserved         = 0;
++        h->frame_counter    = 0;
++        h->seq              = 0; /* even = stable */
++    }
++
++    return s_view;
++}
++
++#else /* !_WIN32 */
++
++/* Non-Windows builds compile the same call sites but capture nothing. */
++static uint8_t *s_view = NULL;
++
++static uint8_t *mc_capture_get_view(void) { return NULL; }
++
++#endif /* _WIN32 */
++
++/* ------------------------------------------------------------------------- */
++/* Capture state                                                             */
++/* ------------------------------------------------------------------------- */
++
++static float  s_near_plane = 0.0f;
++static float  s_far_plane  = 0.0f;
++static int    s_interval   = -1;  /* -1 = not yet read from env */
++static bool   s_enabled    = true;
++static bool   s_env_read   = false;
++static uint64_t s_frame_index = 0;
++
++static void mc_capture_read_env(void) {
++    if (s_env_read) { return; }
++    s_env_read = true;
++
++    {
++        const char *v = getenv("SM64MC_CAPTURE");
++        if (v && (v[0] == '0') && (v[1] == '\0')) { s_enabled = false; }
++    }
++    {
++        const char *v = getenv("SM64MC_CAPTURE_INTERVAL");
++        if (v && v[0]) {
++            long n = strtol(v, NULL, 10);
++            if (n >= 1 && n <= 100000) { s_interval = (int)n; }
++        }
++    }
++    if (s_interval < 1) { s_interval = 1; }
++}
++
++bool mc_capture_should_capture(void) {
++    mc_capture_read_env();
++    if (!s_enabled) { return false; }
++    if (s_interval <= 1) { return true; }
++    return (s_frame_index % (uint64_t)s_interval) == 0;
++}
++
++void mc_capture_set_projection(float near_plane, float far_plane) {
++    s_near_plane = near_plane;
++    s_far_plane  = far_plane;
++}
++
++bool mc_capture_begin(McCaptureFrame *f, uint32_t width, uint32_t height, uint32_t depth_convention, uint32_t flags) {
++    uint8_t *view;
++    struct McCaptureHeader *hdr;
++
++    if (f == NULL) { return false; }
++    f->active = false;
++
++    if (!s_enabled) { return false; }
++    if (width == 0 || height == 0) { return false; }
++    if (width > MC_CAPTURE_MAX_W || height > MC_CAPTURE_MAX_H) {
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            fprintf(stderr, "[mc_capture] frame %ux%u exceeds max %ux%u, skipping\n",
++                    (unsigned)width, (unsigned)height,
++                    (unsigned)MC_CAPTURE_MAX_W, (unsigned)MC_CAPTURE_MAX_H);
++        }
++        return false;
++    }
++
++    view = mc_capture_get_view();
++    if (view == NULL) { return false; }
++
++    hdr = (struct McCaptureHeader *)view;
++
++    /* Enter the critical section: seq becomes odd. */
++    {
++        uint64_t s = hdr->seq;
++        s |= 1u;
++        MC_COMPILER_BARRIER();
++        hdr->seq = s;
++        f->seq = s;
++    }
++    MC_COMPILER_BARRIER();
++
++    hdr->version          = MC_CAPTURE_VERSION;
++    hdr->header_size      = MC_CAPTURE_HEADER_SIZE;
++    hdr->width            = width;
++    hdr->height           = height;
++    hdr->stride           = width * 4u;
++    hdr->depth_convention = depth_convention;
++    hdr->near_plane       = s_near_plane;
++    hdr->far_plane        = s_far_plane;
++    hdr->flags            = flags | MC_FLAG_DEPTH_PRESENT;
++    hdr->reserved         = 0;
++
++    f->color  = view + MC_COLOR_OFFSET;
++    f->depth  = (float *)(view + MC_DEPTH_OFFSET);
++    f->width  = width;
++    f->height = height;
++    f->active = true;
++    return true;
++}
++
++void mc_capture_end(McCaptureFrame *f) {
++    struct McCaptureHeader *hdr;
++
++    if (f == NULL || !f->active) { return; }
++    f->active = false;
++
++    if (s_view == NULL) { return; }
++    hdr = (struct McCaptureHeader *)s_view;
++
++    hdr->frame_counter++;
++    MC_COMPILER_BARRIER();
++    hdr->seq = f->seq + 1u; /* even = stable */
++    MC_COMPILER_BARRIER();
++
++    s_frame_index++;
++}
++
++void mc_capture_shutdown(void) {
++#if defined(_WIN32)
++    if (s_view) {
++        UnmapViewOfFile(s_view);
++        s_view = NULL;
++    }
++    if (s_mapping) {
++        CloseHandle(s_mapping);
++        s_mapping = NULL;
++    }
++#else
++    s_view = NULL;
++#endif
++}
+diff --git a/src/pc/mc_capture.h b/src/pc/mc_capture.h
+new file mode 100644
+index 0000000..0181ac7
+--- /dev/null
++++ b/src/pc/mc_capture.h
+@@ -0,0 +1,112 @@
++#ifndef MC_CAPTURE_H
++#define MC_CAPTURE_H
++
++/*
++ * mc_capture — sm64coopdx frame capture to a Windows shared-memory segment.
++ *
++ * Publishes the just-rendered colour (RGBA8) and depth (f32) buffers of the
++ * game's default framebuffer to a named shared mapping so another process
++ * (the Minecraft passthrough mod) can composite them.
++ *
++ * Hook point: gfx_opengl_end_frame() in src/pc/gfx/gfx_opengl.c, which is
++ * reached once per drawn frame from gfx_end_frame_render() (gfx_pc.c) /
++ * produce_interpolation_frames_and_delay() (pc_main.c), AFTER the scene and
++ * HUD display list has been submitted and flushed, and BEFORE the buffer swap.
++ *
++ * This file is backend-agnostic (no GL/D3D calls). The OpenGL backend fills
++ * the shared mapping directly via glReadPixels; the D3D11 backend fills it from
++ * staging-texture copies. See README.md for the full layout and rationale.
++ */
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Shared-memory object name. "Local\" keeps it session-private. */
++#define MC_CAPTURE_SHM_NAME L"Local\\SM64MCFrame"
++
++/* Header magic (8 bytes, NOT null terminated) and layout version. */
++#define MC_CAPTURE_MAGIC0 'S'
++#define MC_CAPTURE_VERSION 1u
++
++/*
++ * Fixed maximum capture dimensions. The mapping is created once at this size
++ * so a reader can map it once and keep it open across resolution changes.
++ * Frames larger than this are skipped (and the reason logged once).
++ */
++#define MC_CAPTURE_MAX_W 2560u
++#define MC_CAPTURE_MAX_H 1440u
++
++/* Header is exactly 64 bytes (see mc_capture.c). */
++#define MC_CAPTURE_HEADER_SIZE 64u
++
++/* Total mapping size in bytes. Reader should map exactly this much. */
++#define MC_CAPTURE_MAPPING_SIZE \
++    (MC_CAPTURE_HEADER_SIZE + 2u * MC_CAPTURE_MAX_W * MC_CAPTURE_MAX_H * 4u)
++
++/* depth_convention values written into the header. */
++#define MC_DEPTH_CONVENTION_GL_NEG1_TO_1 0u /* GL: window depth 0..1, near=0 far=1 */
++#define MC_DEPTH_CONVENTION_D3D_0_TO_1   1u /* D3D: window depth 0..1, near=0 far=1 */
++
++/* flags bits in the header. */
++#define MC_FLAG_REVERSED_Z    (1u << 0) /* 0 = NOT reversed-Z */
++#define MC_FLAG_DEPTH_PRESENT (1u << 1)
++#define MC_FLAG_ORIGIN_BOTTOM (1u << 2) /* row 0 is the BOTTOM row (OpenGL) */
++
++/*
++ * A single in-flight capture. begin() opens (and on first use creates) the
++ * mapping, flips the seqlock to "odd / writing", writes the header, and hands
++ * back writable pointers. The backend then fills them (glReadPixels) and calls
++ * end() to publish (seqlock -> "even / stable").
++ *
++ * IMPORTANT: every begin() MUST be paired with an end().
++ */
++typedef struct McCaptureFrame {
++    uint8_t *color;   /* w*h*4 bytes, RGBA8, row 0 = bottom for OpenGL          */
++    float   *depth;   /* w*h*4 bytes, f32,   same row origin as color           */
++    uint64_t seq;     /* seqlock value while odd                               */
++    uint32_t width;
++    uint32_t height;
++    bool     active;
++} McCaptureFrame;
++
++/*
++ * Returns true if this frame should be captured. Honours the environment:
++ *   SM64MC_CAPTURE=0          disable capture entirely
++ *   SM64MC_CAPTURE_INTERVAL=N capture every Nth frame (default 1)
++ * Cheap; call once per frame before begin().
++ */
++bool mc_capture_should_capture(void);
++
++/*
++ * Records the effective near/far planes of the current scene projection.
++ * Called from gfx_sp_matrix() (gfx_pc.c) whenever a scene projection matrix
++ * is loaded (G_MTX_PROJECTION | G_MTX_LOAD), extracted from the matrix itself.
++ */
++void mc_capture_set_projection(float near_plane, float far_plane);
++
++/*
++ * Opens the mapping and marks it as being written. Returns false (leaving the
++ * mapping untouched) if capture is disabled, the frame is too large, or the
++ * mapping could not be created. On success, fill f->color and f->depth, then
++ * call mc_capture_end(f).
++ *
++ * flags should carry the row-origin bit (MC_FLAG_ORIGIN_BOTTOM for OpenGL,
++ * 0 for D3D11). MC_FLAG_DEPTH_PRESENT is set by this function.
++ */
++bool mc_capture_begin(McCaptureFrame *f, uint32_t w, uint32_t h, uint32_t depth_convention, uint32_t flags);
++
++/* Publishes the frame (seqlock -> even) and releases the frame. */
++void mc_capture_end(McCaptureFrame *f);
++
++/* Releases the mapping. Safe to call at shutdown. */
++void mc_capture_shutdown(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* MC_CAPTURE_H */
